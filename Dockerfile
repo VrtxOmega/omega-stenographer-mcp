@@ -18,4 +18,4 @@ ENV PYTHONUNBUFFERED=1
 ENV PYTHONUTF8=1
 
 # Default: stdio transport (Glama inspection compatible)
-ENTRYPOINT ["python", "omega_stenographer_mcp_standalone.py"]
+CMD ["python", "omega_stenographer_mcp_standalone.py"]
