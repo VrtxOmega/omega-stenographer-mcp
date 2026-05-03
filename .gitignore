@@ -1,0 +1,28 @@
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+*.egg-info/
+dist/
+build/
+.eggs/
+
+# Stenographer data (local SQLite — never commit)
+*.db
+*.db-wal
+*.db-shm
+
+# Env
+.env
+.venv/
+venv/
+
+# pytest
+.pytest_cache/
+.coverage
+
+# IDE
+.vscode/
+.idea/
+*.swp

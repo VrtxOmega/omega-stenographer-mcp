@@ -1,0 +1,29 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "omega-stenographer-mcp"
+version = "1.0.0"
+description = "Passive session observer MCP server — ingests every agent turn, extracts decisions and blockers, builds running notes, auto-compresses stale context into searchable briefs"
+readme = "README.md"
+license = { text = "MIT" }
+requires-python = ">=3.11"
+keywords = ["mcp", "ai", "session-observer", "context-compression", "memory", "stenographer", "briefing"]
+classifiers = [
+    "Development Status :: 4 - Beta",
+    "Intended Audience :: Developers",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Topic :: Scientific/Engineering :: Artificial Intelligence",
+]
+dependencies = [
+    "mcp>=1.0.0",
+]
+
+[project.scripts]
+omega-stenographer-mcp = "omega_stenographer_mcp_standalone:cli"
+
+[tool.setuptools]
+py-modules = ["omega_stenographer_mcp_standalone"]
