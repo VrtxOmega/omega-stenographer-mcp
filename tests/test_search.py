@@ -21,23 +21,41 @@ def db():
 
     # Insert test data
     exchanges = [
-        ("user", "Fix the authentication bug in the login module", json.dumps(["debug auth"]), json.dumps(["login broken"]), "search-test"),
-        ("assistant", "Found JWT secret key mismatch in validation endpoint", json.dumps(["JWT fix applied"]), "[]", "search-test"),
+        (
+            "user",
+            "Fix the authentication bug in the login module",
+            json.dumps(["debug auth"]),
+            json.dumps(["login broken"]),
+            "search-test",
+        ),
+        (
+            "assistant",
+            "Found JWT secret key mismatch in validation endpoint",
+            json.dumps(["JWT fix applied"]),
+            "[]",
+            "search-test",
+        ),
         ("user", "Deploy the fix to production", "[]", "[]", "search-test"),
-        ("assistant", "Deployment successful. Monitoring for 24 hours.", json.dumps(["deployed"]), "[]", "search-test"),
+        (
+            "assistant",
+            "Deployment successful. Monitoring for 24 hours.",
+            json.dumps(["deployed"]),
+            "[]",
+            "search-test",
+        ),
     ]
 
     for role, content, decisions, blockers, sid in exchanges:
-        cur = db.execute(
+        cur = conn.execute(
             "INSERT INTO exchanges (role, content, decisions, blockers, session_id) VALUES (?,?,?,?,?)",
-            (role, content, decisions, blockers, sid)
+            (role, content, decisions, blockers, sid),
         )
         ex_id = cur.lastrowid
-        db.execute(
+        conn.execute(
             "INSERT INTO exchanges_fts(rowid, content, decisions, blockers) VALUES (?,?,?,?)",
-            (ex_id, content[:4000], decisions, blockers)
+            (ex_id, content[:4000], decisions, blockers),
         )
-    db.commit()
+    conn.commit()
     yield conn
     conn.close()
 
