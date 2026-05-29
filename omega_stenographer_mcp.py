@@ -113,6 +113,20 @@ def cosine_sim(a, b):
     nb = math.sqrt(sum(y*y for y in b))
     return dot/(na*nb) if na*nb > 0 else 0
 
+def normalize_fts_query(query, max_terms=12):
+    """Build a forgiving FTS query for hyphenated paths, trace IDs, and tool names."""
+    terms = []
+    seen = set()
+    for term in re.findall(r'[A-Za-z0-9_]{2,}', query):
+        lowered = term.lower()
+        if lowered in seen:
+            continue
+        seen.add(lowered)
+        terms.append(term)
+        if len(terms) >= max_terms:
+            break
+    return " OR ".join(terms)
+
 # ── Core Logic ─────────────────────────────────────────────
 def extract_decisions(text):
     """Extract decision-like statements"""
@@ -312,7 +326,7 @@ async def call_tool(name: str, arguments: dict):
                                   f"Payload: {json.dumps(sd.get('payload',{}))[:200]} | "
                                   f"Timestamp: {sd.get('timestamp','')}")
                     sd_blockers = ["CLAEG:TERMINAL_SHUTDOWN"]
-                    conn.execute(
+                    sd_cur = conn.execute(
                         "INSERT INTO exchanges "
                         "(role, content, decisions, blockers, tier, milestone, session_id, trace_id) "
                         "VALUES (?,?,?,?,?,?,?,?)",
@@ -320,7 +334,7 @@ async def call_tool(name: str, arguments: dict):
                          json.dumps(sd_blockers), "A", "TERMINAL_SHUTDOWN",
                          session_id, trace_id)
                     )
-                    sd_id = conn.lastrowid
+                    sd_id = sd_cur.lastrowid
                     conn.execute(
                         "INSERT INTO exchanges_fts(rowid, content, decisions, blockers) VALUES (?,?,?,?)",
                         (sd_id, sd_content[:4000], json.dumps([]), json.dumps(sd_blockers))
@@ -328,14 +342,14 @@ async def call_tool(name: str, arguments: dict):
                     shutdown_note = " | ⚠ TERMINAL_SHUTDOWN auto-ingested from bridge"
 
         # ── Write the actual exchange ────────────────────────────
-        conn.execute(
+        ex_cur = conn.execute(
             "INSERT INTO exchanges "
             "(role, content, decisions, blockers, tier, session_id, trace_id, nafe_flags) "
             "VALUES (?,?,?,?,?,?,?,?)",
             (role, content, json.dumps(decisions), json.dumps(blockers),
              tier, session_id, trace_id, nafe_flags_json)
         )
-        ex_id = conn.lastrowid
+        ex_id = ex_cur.lastrowid
 
         conn.execute(
             "INSERT INTO exchanges_fts(rowid, content, decisions, blockers) VALUES (?,?,?,?)",
@@ -469,23 +483,44 @@ async def call_tool(name: str, arguments: dict):
     elif name == "stenographer_query_history":
         query = arguments["query"]
         limit = arguments.get("limit", 10)
+        used_query = query
+        query_note = ""
         try:
             rows = conn.execute(
-                "SELECT content, decisions, id FROM exchanges_fts WHERE exchanges_fts MATCH ? LIMIT ?",
+                "SELECT rowid, content, decisions FROM exchanges_fts WHERE exchanges_fts MATCH ? LIMIT ?",
                 (query, limit)
             ).fetchall()
-        except:
+        except sqlite3.Error as exc:
             rows = []
+            fallback_query = normalize_fts_query(query)
+            if fallback_query and fallback_query != query:
+                try:
+                    rows = conn.execute(
+                        "SELECT rowid, content, decisions FROM exchanges_fts WHERE exchanges_fts MATCH ? LIMIT ?",
+                        (fallback_query, limit)
+                    ).fetchall()
+                    used_query = fallback_query
+                    query_note = f"\n_Fallback query used after FTS parse error: `{fallback_query}`_\n\n"
+                except sqlite3.Error as fallback_exc:
+                    query_note = f"\n_Query error: {fallback_exc}_\n\n"
+            else:
+                query_note = f"\n_Query error: {exc}_\n\n"
         
         result = f"# Search: '{query}'\n\n"
+        if used_query != query:
+            result += query_note
+        elif query_note:
+            result += query_note
         for r in rows:
-            result += f"### [#{r[2]}] {r[0][:300]}\n"
-            if r[1]:
-                decisions = json.loads(r[1]) if isinstance(r[1], str) else r[1]
+            result += f"### [#{r[0]}] {r[1][:300]}\n"
+            if r[2]:
+                decisions = json.loads(r[2]) if isinstance(r[2], str) else r[2]
                 result += f"Decisions: {'; '.join(decisions[:2])}\n"
             result += "\n"
+        if not rows and not query_note:
+            result += "No results found.\n"
         
-        return [TextContent(type="text", text=result or "No results found.")]
+        return [TextContent(type="text", text=result)]
 
 @server.read_resource()
 async def read_resource(uri: str):
