@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "omega-stenographer-mcp"
-version = "1.0.0"
+version = "2.0.0"
 description = "Passive session observer MCP server — ingests every agent turn, extracts decisions and blockers, builds running notes, auto-compresses stale context into searchable briefs"
 readme = "README.md"
 license = { text = "MIT" }
@@ -19,11 +19,12 @@ classifiers = [
     "Topic :: Scientific/Engineering :: Artificial Intelligence",
 ]
 dependencies = [
-    "mcp>=1.0.0",
+    "mcp>=1.30.0,<2",
+    "jsonschema>=4,<5",
 ]
 
 [project.scripts]
 omega-stenographer-mcp = "omega_stenographer_mcp_standalone:cli"
 
 [tool.setuptools]
-py-modules = ["omega_stenographer_mcp_standalone"]
+py-modules = ["omega_stenographer_mcp_standalone", "omega_stenographer_mcp", "omega_runtime", "veritas_bridge", "codex_capture", "steno_client", "stdio_client"]
