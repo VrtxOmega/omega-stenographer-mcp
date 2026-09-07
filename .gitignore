@@ -6,3 +6,13 @@ __pycache__/
 *.db
 *.db-wal
 *.db-shm
+
+.venv/
+node_modules/
+__pycache__/
+*.pyc
+*.key
+.env
+.env.*
+data/
+.sswp.json

@@ -33,6 +33,10 @@ Shared directory: ~/.veritas-shared/  (override: VERITAS_SHARED_DIR env var)
 """
 
 import json
+import sys
+
+import omega_runtime as runtime
+from contextlib import closing
 import math
 import os
 import re
@@ -64,201 +68,72 @@ def generate_trace_id() -> str:
     uid = uuid.uuid4().hex[:8]
     return f"VT-{date_str}-{uid}"
 
-def get_trace() -> dict:
-    """Read current trace state from shared file. Returns {} if not found."""
-    if TRACE_FILE.exists():
-        try:
-            return json.loads(TRACE_FILE.read_text(encoding="utf-8"))
-        except Exception:
-            pass
-    return {}
+def get_trace(task_id=None):
+    return runtime.trace(task_id) if task_id else {}
 
-def set_trace(trace_id: str, claeg_state: str = "STABLE_CONTINUATION",
-              extra: dict = None) -> dict:
-    """Write trace state to shared file. Returns the written record."""
-    record = {
-        "trace_id": trace_id,
-        "claeg_state": claeg_state,
-        "updated_at": datetime.now(timezone.utc).isoformat(),
-        **(extra or {}),
-    }
-    TRACE_FILE.write_text(json.dumps(record, indent=2), encoding="utf-8")
-    return record
+def set_trace(trace_id,claeg_state='STABLE_CONTINUATION',extra=None,task_id=None):
+    task_id=task_id or (extra or {}).get('task_id')
+    if not task_id:raise ValueError('task_id required for trace mutation')
+    value=dict(extra or {},trace_id=trace_id,claeg_state=claeg_state,task_id=task_id,updated_at=datetime.now(timezone.utc).isoformat())
+    with closing(runtime.bus()) as db:db.execute('INSERT OR REPLACE INTO traces VALUES(?,?)',(task_id,runtime.canonical(value)))
+    return value
 
-def get_or_create_trace() -> str:
-    """Return existing trace ID or generate + persist a new one."""
-    t = get_trace()
-    if t.get("trace_id"):
-        return t["trace_id"]
-    tid = generate_trace_id()
-    set_trace(tid)
-    return tid
+def get_or_create_trace(task_id=None):
+    return runtime.trace(task_id)['trace_id'] if task_id else ''
 
-def update_claeg_state(claeg_state: str) -> dict:
-    """Update only the CLAEG state in the current trace record."""
-    t = get_trace()
-    tid = t.get("trace_id") or generate_trace_id()
-    return set_trace(tid, claeg_state=claeg_state, extra={
-        k: v for k, v in t.items()
-        if k not in ("trace_id", "claeg_state", "updated_at")
-    })
+def update_claeg_state(claeg_state,task_id=None):
+    if not task_id: return {'updated':False,'reason':'task_id required'}
+    t=runtime.trace(task_id)
+    return set_trace(t['trace_id'],claeg_state,task_id=task_id)
 
 # ══════════════════════════════════════════════════════════════════════════════
 # CROSS-SYSTEM EVENT BUS
 # ══════════════════════════════════════════════════════════════════════════════
 
-def emit_event(event_type: str, payload: dict, source: str = "unknown") -> None:
-    """Append a structured event to the shared JSONL event bus. Non-fatal on error."""
-    try:
-        entry = {
-            "trace_id": get_or_create_trace(),
-            "event_type": event_type,
-            "source": source,
-            "payload": payload,
-            "timestamp": datetime.now(timezone.utc).isoformat(),
-        }
-        with EVENTS_FILE.open("a", encoding="utf-8") as f:
-            f.write(json.dumps(entry, default=str) + "\n")
-    except Exception:
-        pass  # Event bus failure is always non-fatal
+def emit_event(event_type,payload,source='unknown',task_id=None):
+    return runtime.event(task_id or payload.get('task_id') or 'system',event_type,dict(payload,source=source))
 
-def read_events(limit: int = 20, event_type: str = None,
-                since_trace_id: str = None) -> list:
-    """
-    Read recent events from the shared event bus, newest first.
-    Optionally filter by event_type.
-    """
-    if not EVENTS_FILE.exists():
-        return []
-    try:
-        lines = EVENTS_FILE.read_text(encoding="utf-8").strip().splitlines()
-    except Exception:
-        return []
-    events = []
-    for line in reversed(lines):
-        try:
-            e = json.loads(line)
-            if event_type and e.get("event_type") != event_type:
-                continue
-            events.append(e)
-            if len(events) >= limit:
-                break
-        except Exception:
-            pass
-    return events
+def read_events(limit=20,event_type=None,source=None,task_id=None):
+    if not task_id:return []
+    with closing(runtime.bus()) as db:
+        rows=db.execute('SELECT * FROM events WHERE task_id=? ORDER BY created_at DESC LIMIT ?',(task_id,max(1,min(limit,100)))).fetchall()
+    result=[]
+    for r in rows:
+        payload=json.loads(r['payload'])
+        if event_type and r['event_type']!=event_type:continue
+        if source and payload.get('source')!=source:continue
+        result.append(dict(r,payload=payload,timestamp=r['created_at']))
+    return result
 
-def get_recent_terminal_shutdowns(limit: int = 3) -> list:
-    """Return recent CLAEG_TERMINAL_SHUTDOWN events for Stenographer to ingest."""
-    return read_events(limit=limit, event_type="CLAEG_TERMINAL_SHUTDOWN")
+def get_recent_terminal_shutdowns(limit=3,task_id=None):
+    return read_events(limit,'CLAEG_TERMINAL_SHUTDOWN',task_id=task_id)
 
 # ══════════════════════════════════════════════════════════════════════════════
 # SSWP REGISTRY READER  (read-only)
 # ══════════════════════════════════════════════════════════════════════════════
 
-def read_sswp_health(limit: int = 5) -> dict:
-    """
-    Read SSWP fleet health from the registry SQLite.
-    Returns a summary dict compatible with omega_write_handoff and omega_ecosystem_status.
-    """
-    if not SSWP_DB_PATH.exists():
-        return {"available": False, "reason": f"SSWP registry not found at {SSWP_DB_PATH}"}
-    try:
-        conn = sqlite3.connect(str(SSWP_DB_PATH))
-        conn.row_factory = sqlite3.Row
-        # Use the v_node_health view
-        total = conn.execute("SELECT COUNT(*) FROM nodes").fetchone()[0]
-        rows  = conn.execute("""
-            SELECT name, overall_status, adversarial_risk, risk_score, run_at
-            FROM attestations a
-            JOIN nodes n USING(node_id)
-            ORDER BY run_at DESC LIMIT 200
-        """).fetchall()
-
-        passing    = sum(1 for r in rows if r["overall_status"] == "PASS")
-        failing    = sum(1 for r in rows if r["overall_status"] in ("FAIL", "PARTIAL"))
-        at_risk    = [dict(r) for r in rows
-                      if r["adversarial_risk"] and float(r["adversarial_risk"]) > 0.1]
-        last_run   = rows[0]["run_at"] if rows else None
-        pass_rate  = f"{(passing / len(rows) * 100):.1f}%" if rows else "N/A"
-
-        top_risk = sorted(at_risk, key=lambda x: float(x.get("adversarial_risk") or 0),
-                          reverse=True)[:limit]
-        # Sanitize for JSON
-        top_risk_clean = [{
-            "name": r["name"],
-            "status": r["overall_status"],
-            "adversarial_risk_pct": f"{float(r['adversarial_risk'] or 0)*100:.1f}%",
-            "risk_score_pct": f"{float(r['risk_score'] or 0)*100:.1f}%",
-            "last_run": r["run_at"],
-        } for r in top_risk]
-
-        conn.close()
-        return {
-            "available": True,
-            "nodes_total": total,
-            "attested_count": len(rows),
-            "passing": passing,
-            "failing": failing,
-            "pass_rate": pass_rate,
-            "at_risk_count": len(at_risk),
-            "last_witness": last_run,
-            "top_risk_nodes": top_risk_clean,
-        }
-    except Exception as e:
-        return {"available": False, "reason": str(e)}
+def read_sswp_health(limit=5):
+    if not SSWP_DB_PATH.exists():return {'available':False}
+    with closing(sqlite3.connect(SSWP_DB_PATH.as_uri()+'?mode=ro',uri=True)) as db:
+        db.row_factory=sqlite3.Row
+        rows=db.execute('WITH ranked AS (SELECT a.*,ROW_NUMBER() OVER(PARTITION BY node_id ORDER BY run_at DESC,attestation_id DESC) rn FROM attestations a) SELECT n.name,n.repo_path,r.overall_status,r.run_at,r.adversarial_risk FROM nodes n LEFT JOIN ranked r ON r.node_id=n.node_id AND r.rn=1').fetchall()
+        history=db.execute('SELECT COUNT(*) FROM attestations').fetchone()[0]
+    result=[dict(r,local_path_exists=Path(r['repo_path']).exists(),evidence_scope='historical; verify freshness before reuse') for r in rows]
+    return {'available':True,'nodes_total':len(rows),'history_runs':history,'latest_per_node':True,'passing_nodes':sum(r['overall_status']=='PASS' for r in rows),'nodes':result[:limit]}
 
 # ══════════════════════════════════════════════════════════════════════════════
 # STENOGRAPHER BRIEF READER  (read-only)
 # ══════════════════════════════════════════════════════════════════════════════
 
-def read_steno_brief(limit: int = 5, session_id: str = None) -> dict:
-    """
-    Read recent Stenographer briefs and milestones from steno.db.
-    Returns a dict compatible with omega_preload_context.
-    """
-    if not STENO_DB_PATH.exists():
-        return {"available": False, "reason": f"Stenographer DB not found at {STENO_DB_PATH}"}
-    try:
-        conn = sqlite3.connect(str(STENO_DB_PATH))
-        conn.row_factory = sqlite3.Row
-
-        # Tier-A briefs first, then recent
-        briefs = conn.execute("""
-            SELECT id, summary, tier, created_at FROM briefs
-            ORDER BY CASE tier WHEN 'A' THEN 0 ELSE 1 END, id DESC
-            LIMIT ?
-        """, (limit,)).fetchall()
-
-        # Recent milestones
-        milestones = conn.execute("""
-            SELECT id, milestone, decisions, created_at FROM exchanges
-            WHERE milestone IS NOT NULL ORDER BY id DESC LIMIT ?
-        """, (limit,)).fetchall()
-
-        # Uncompressed count
-        uncompressed = conn.execute(
-            "SELECT COUNT(*) FROM exchanges WHERE compressed=0"
-        ).fetchone()[0]
-
-        conn.close()
-
-        return {
-            "available": True,
-            "recent_briefs": [{
-                "id": b["id"], "summary": b["summary"][:250],
-                "tier": b["tier"], "created_at": b["created_at"],
-            } for b in briefs],
-            "milestones": [{
-                "id": m["id"],
-                "label": m["milestone"],
-                "decisions": (json.loads(m["decisions"])
-                              if isinstance(m["decisions"], str) else m["decisions"] or []),
-                "at": m["created_at"],
-            } for m in milestones],
-            "uncompressed_turns": uncompressed,
-        }
-    except Exception as e:
-        return {"available": False, "reason": str(e)}
+def read_steno_brief(limit=5,session_id=None,task_id=None):
+    scope=task_id or session_id
+    if not STENO_DB_PATH.exists():return {'available':False}
+    with closing(sqlite3.connect(STENO_DB_PATH.as_uri()+'?mode=ro',uri=True)) as db:
+        db.row_factory=sqlite3.Row
+        if not scope:return {'available':True,'scope_required':True,'exchanges':db.execute('SELECT COUNT(*) FROM exchanges').fetchone()[0]}
+        rows=db.execute('SELECT id,summary,tier,created_at,source_turns FROM briefs WHERE session_id=? ORDER BY id DESC LIMIT ?',(scope,limit)).fetchall()
+        uncompressed=db.execute('SELECT COUNT(*) FROM exchanges WHERE session_id=? AND compressed=0',(scope,)).fetchone()[0]
+    return {'available':True,'task_id':scope,'recent_briefs':[dict(r) for r in rows],'uncompressed_turns':uncompressed}
 
 # ══════════════════════════════════════════════════════════════════════════════
 # NAFE FAILURE SIGNATURE SCANNER
@@ -339,55 +214,18 @@ TFIDF_DIM = 128  # single source of truth for embedding dimension
 def tokenize(text: str) -> list:
     return re.findall(r'[a-zA-Z]{3,}', text.lower())
 
-def tfidf_embed(text: str, dim: int = TFIDF_DIM) -> list:
-    tokens = tokenize(text)
-    if not tokens:
-        return [0.0] * dim
-    tf: dict = {}
-    for t in tokens:
-        tf[t] = tf.get(t, 0) + 1
-    vec = [0.0] * dim
-    for t, freq in tf.items():
-        vec[abs(hash(t)) % dim] += freq / len(tokens)
-    norm = math.sqrt(sum(v * v for v in vec))
-    return [v / norm for v in vec] if norm > 0 else vec
+def tfidf_embed(text,dim=512):
+    return runtime.embed(text)
 
-def cosine_sim(a: list, b: list) -> float:
-    if not a or not b:
-        return 0.0
-    n = min(len(a), len(b))
-    dot = sum(x * y for x, y in zip(a[:n], b[:n]))
-    na  = math.sqrt(sum(x * x for x in a[:n])) or 1.0
-    nb  = math.sqrt(sum(y * y for y in b[:n])) or 1.0
-    return max(-1.0, min(1.0, dot / (na * nb)))
+def cosine_sim(a,b):
+    return runtime.cosine(a,b)
 
 # ══════════════════════════════════════════════════════════════════════════════
 # ECOSYSTEM STATUS SUMMARY
 # ══════════════════════════════════════════════════════════════════════════════
 
-def ecosystem_summary() -> dict:
-    """
-    Return a unified status summary of all three MCP systems.
-    Used by omega_ecosystem_status tool in Omega Brain.
-    """
-    trace = get_trace()
-    sswp  = read_sswp_health(limit=3)
-    steno = read_steno_brief(limit=3)
-    recent_events = read_events(limit=10)
-
-    return {
-        "shared_trace": {
-            "trace_id": trace.get("trace_id", "UNSET"),
-            "claeg_state": trace.get("claeg_state", "UNKNOWN"),
-            "last_updated": trace.get("updated_at", "never"),
-        },
-        "sswp": sswp,
-        "stenographer": steno,
-        "recent_events": [{
-            "event_type": e.get("event_type"),
-            "source": e.get("source"),
-            "timestamp": e.get("timestamp"),
-            "summary": str(e.get("payload", {}))[:120],
-        } for e in recent_events],
-        "generated_at": datetime.now(timezone.utc).isoformat(),
-    }
+def ecosystem_summary(task_id=None):
+    capture_path=STENO_DB_PATH.parent/'capture-state.json'
+    capture=json.loads(capture_path.read_text()) if capture_path.exists() else {'last_error':'capture has not run'}
+    capture.pop('files',None)
+    return {'shared_trace':get_trace(task_id),'sswp':read_sswp_health(),'stenographer':read_steno_brief(task_id=task_id),'capture':capture,'pending_brain_events':len(runtime.pending('brain-v2')),'recent_events':read_events(task_id=task_id),'generated_at':datetime.now(timezone.utc).isoformat()}

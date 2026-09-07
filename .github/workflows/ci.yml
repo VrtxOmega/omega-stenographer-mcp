@@ -1,37 +1,23 @@
-name: CI
-
+name: MCP contracts
 on:
   push:
     branches: [main]
   pull_request:
     branches: [main]
-
+permissions:
+  contents: read
 jobs:
-  test:
-    runs-on: ubuntu-latest
+  contracts:
     strategy:
       matrix:
-        python-version: ["3.11", "3.12"]
-
+        os: [ubuntu-latest, windows-latest]
+    runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v4
-
-      - name: Set up Python ${{ matrix.python-version }}
-        uses: actions/setup-python@v5
+      - uses: actions/setup-python@v5
         with:
-          python-version: ${{ matrix.python-version }}
-
-      - name: Install dependencies
-        run: |
-          python -m pip install --upgrade pip
-          pip install mcp pytest pytest-asyncio pytest-cov
-
-      - name: Verify standalone parses cleanly
-        run: python -c "import ast; ast.parse(open('omega_stenographer_mcp_standalone.py').read()); print('PARSE_OK')"
-
-      - name: Run tests with coverage
+          python-version: '3.12'
+      - run: python -m pip install -r requirements.txt pytest
+      - run: python -m pytest tests/ -v
         env:
-          PYTHONUTF8: "1"
-          OMEGA_STENOGRAPHER_DIR: /tmp/steno-ci
-        run: |
-          pytest tests/ -v --tb=short --cov=omega_stenographer_mcp_standalone
+          PYTHONUTF8: '1'

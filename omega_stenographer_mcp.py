@@ -16,12 +16,53 @@ del _os, _sys
 Ingests every turn, extracts decisions/blockers, builds running notes,
 and returns compressed briefs when compaction threatens context loss.
 """
-import os, sys, re, json, sqlite3, hashlib, time, math
+import os, sys, re, json, sqlite3, hashlib, time, math, asyncio
 from datetime import datetime, timezone
 from pathlib import Path
+from contextlib import asynccontextmanager
+
+import anyio
+
+import omega_runtime as runtime
+from mcp import types
 from mcp.server import Server, NotificationOptions
-from mcp.server.stdio import stdio_server
+from mcp.shared.message import SessionMessage
 from mcp.types import Tool, TextContent, Resource
+
+
+@asynccontextmanager
+async def stdio_server():
+    """Line-delimited stdio transport that works reliably with piped stdin."""
+    read_send, read_recv = anyio.create_memory_object_stream(0)
+    write_send, write_recv = anyio.create_memory_object_stream(0)
+
+    async def stdin_reader():
+        async with read_send:
+            while True:
+                line = await asyncio.to_thread(sys.stdin.readline)
+                if line == "":
+                    break
+                try:
+                    message = types.JSONRPCMessage.model_validate_json(line)
+                except Exception as exc:
+                    await read_send.send(exc)
+                    continue
+                await read_send.send(SessionMessage(message))
+
+    async def stdout_writer():
+        async with write_recv:
+            async for session_message in write_recv:
+                payload = session_message.message.model_dump_json(
+                    by_alias=True,
+                    exclude_none=True,
+                )
+                print(payload, flush=True)
+
+    async with anyio.create_task_group() as tg:
+        tg.start_soon(stdin_reader)
+        tg.start_soon(stdout_writer)
+        yield read_recv, write_send
+        tg.cancel_scope.cancel()
 
 # ── VERITAS Bridge (cross-system integration) ──────────────────
 try:
@@ -42,7 +83,9 @@ DB_PATH = STENO_DIR / "steno.db"
 
 # ── Database ───────────────────────────────────────────────
 def get_db():
-    conn = sqlite3.connect(str(DB_PATH))
+    conn = sqlite3.connect(str(DB_PATH), timeout=30.0)
+    conn.row_factory = sqlite3.Row
+    conn.execute("PRAGMA busy_timeout=30000")
     conn.execute("PRAGMA journal_mode=WAL")
     conn.execute("PRAGMA foreign_keys=ON")
     conn.execute("""CREATE TABLE IF NOT EXISTS exchanges (
@@ -91,27 +134,11 @@ def get_db():
 def tokenize(text):
     return re.findall(r'[a-zA-Z]{3,}', text.lower())
 
-def tfidf_embed(text, dim=128):
-    tokens = tokenize(text)
-    if not tokens:
-        return [0.0] * dim
-    tf = {}
-    for t in tokens:
-        tf[t] = tf.get(t, 0) + 1
-    vec = [0.0] * dim
-    for t, freq in tf.items():
-        h = abs(hash(t)) % dim
-        vec[h] += freq / len(tokens)
-    norm = math.sqrt(sum(v*v for v in vec))
-    if norm > 0:
-        vec = [v/norm for v in vec]
-    return vec
+def tfidf_embed(text,dim=512):
+    return runtime.embed(text)
 
-def cosine_sim(a, b):
-    dot = sum(x*y for x,y in zip(a,b))
-    na = math.sqrt(sum(x*x for x in a))
-    nb = math.sqrt(sum(y*y for y in b))
-    return dot/(na*nb) if na*nb > 0 else 0
+def cosine_sim(a,b):
+    return runtime.cosine(a,b)
 
 def normalize_fts_query(query, max_terms=12):
     """Build a forgiving FTS query for hyphenated paths, trace IDs, and tool names."""
@@ -151,77 +178,32 @@ def extract_blockers(text):
         blockers.extend(re.findall(pat, text, re.IGNORECASE))
     return [b.strip() for b in blockers if len(b.strip()) > 5]
 
-def compress_unprocessed(conn, current_session_id: str = None):
-    """
-    Compress unprocessed exchanges into a brief fragment.
-
-    Gap #12 fix: session-aware compression — only batches turns from the
-    CURRENT session, preventing cross-session contamination in briefs.
-    If current_session_id is None, falls back to all-session behaviour
-    (legacy compatibility).
-    """
-    if current_session_id:
-        rows = conn.execute(
-            "SELECT id, role, content, decisions FROM exchanges "
-            "WHERE compressed=0 AND session_id=? ORDER BY id",
-            (current_session_id,)
-        ).fetchall()
-    else:
-        rows = conn.execute(
-            "SELECT id, role, content, decisions FROM exchanges "
-            "WHERE compressed=0 ORDER BY id"
-        ).fetchall()
-
-    if len(rows) < STENO_TURN_LIMIT:
-        return None
-
-    turn_ids = [r[0] for r in rows]
-    combined = " ".join(r[2] for r in rows)
-    all_decisions = []
+def compress_unprocessed(conn,current_session_id=None):
+    if not current_session_id:raise ValueError('session_id required for compression')
+    rows=conn.execute('SELECT id,role,content,decisions,blockers FROM exchanges WHERE compressed=0 AND session_id=? ORDER BY id',(current_session_id,)).fetchall()
+    if len(rows)<STENO_TURN_LIMIT:return None
+    facts=[]
     for r in rows:
-        if r[3]:
-            all_decisions.extend(json.loads(r[3]) if isinstance(r[3], str) else r[3])
-
-    tier = "A" if all_decisions else "B"
-    summary = f"Batch {turn_ids[0]}-{turn_ids[-1]}"
-    if current_session_id:
-        summary += f" [{current_session_id[:16]}]"
-    summary += ": "
-    if all_decisions:
-        summary += "Decisions: " + "; ".join(all_decisions[:3])
-    else:
-        summary += combined[:300] + ("..." if len(combined) > 300 else "")
-
-    cur = conn.execute(
-        "INSERT INTO briefs (summary, tier, source_turns, session_id) VALUES (?, ?, ?, ?)",
-        (summary, tier, json.dumps(turn_ids), current_session_id)
-    )
-    brief_id = cur.lastrowid
-
-    conn.execute(
-        "INSERT INTO briefs_fts(rowid, summary) VALUES (?, ?)",
-        (brief_id, summary)
-    )
-    conn.execute(
-        f"UPDATE exchanges SET compressed=1 WHERE id IN ({','.join('?'*len(turn_ids))})",
-        turn_ids
-    )
-    conn.commit()
-
-    return {"brief_id": brief_id, "summary": summary,
-            "turn_count": len(turn_ids), "tier": tier}
+        text=r[2]
+        facts.append({'exchange_id':r[0],'role':r[1],'decisions':json.loads(r[3] or '[]'),'blockers':json.loads(r[4] or '[]'),'context':text[:1000],'has_more':len(text)>1000,'signals':[m.group(0) for m in re.finditer(r'[^.\n]*(?:next|must|constraint|instead|correction|supersed|unresolved)[^.\n]*',text,re.I)][:12]})
+    summary=json.dumps({'version':2,'session_id':current_session_id,'kind':'extracted context, not verified truth','sources':facts},ensure_ascii=False)
+    ids=[r[0] for r in rows]
+    cur=conn.execute('INSERT INTO briefs(summary,tier,source_turns,session_id) VALUES(?,?,?,?)',(summary,'B',json.dumps(ids),current_session_id))
+    conn.execute('INSERT INTO briefs_fts(rowid,summary) VALUES(?,?)',(cur.lastrowid,summary))
+    conn.executemany('UPDATE exchanges SET compressed=1 WHERE id=?',[(i,) for i in ids]);conn.commit()
+    return {'brief_id':cur.lastrowid,'summary':summary,'turn_count':len(ids),'tier':'B'}
 
 # ── MCP Server ─────────────────────────────────────────────
 server = Server("omega-stenographer")
 
 @server.list_tools()
 async def list_tools():
-    return [
+    tools = [
         Tool(name="stenographer_ingest_exchange",
              description=(
                  "Ingest a conversation turn. Call after every significant user or assistant message. "
                  "Automatically: extracts decisions/blockers via regex, runs NAFE failure-signature "
-                 "scan (sets tier-A if NAFE flags detected), checks for cross-system CLAEG "
+                 "scan (heuristic flags do not establish truth), checks for cross-system CLAEG "
                  "TERMINAL_SHUTDOWN events, and compresses every STENO_TURN_LIMIT turns "
                  "into session-scoped tiered briefs. Pass trace_id from omega_preload_context "
                  "to enable cross-system correlation across Omega Brain, SSWP, and Stenographer."
@@ -256,6 +238,14 @@ async def list_tools():
              }, "required": ["query"]}),
     ]
 
+    for tool in tools:
+        tool.inputSchema['properties']['session_id']={'type':'string','minLength':1}
+        if tool.name!='stenographer_query_history':tool.inputSchema.setdefault('required',[]).append('session_id')
+        if tool.name=='stenographer_query_history':tool.inputSchema['properties']['cross_session']={'type':'boolean','default':False}
+        tool.description=tool.description.replace('tier-A','priority').replace('top-k relevant fragments','task-scoped relevant fragments')
+    tools.append(Tool(name='stenographer_capture_status',description='Report automatic capture progress and delivery errors.',inputSchema={'type':'object','properties':{}}))
+    return tools
+
 @server.list_resources()
 async def list_resources():
     return [
@@ -272,271 +262,186 @@ async def list_resources():
 @server.call_tool()
 async def call_tool(name: str, arguments: dict):
     conn = get_db()
+    try:
     
-    if name == "stenographer_ingest_exchange":
-        role       = arguments["role"]
-        content    = arguments["content"]
-        session_id = arguments.get("session_id", "default")
-        trace_id   = arguments.get("trace_id", "")
+        if name == "stenographer_ingest_exchange":
+            role       = arguments["role"]
+            if role not in ("user","assistant","system"):raise ValueError("Invalid role")
+            content    = arguments["content"]
+            session_id = arguments.get("session_id")
+            if not session_id:raise ValueError("session_id is required")
+            trace_id   = arguments.get("trace_id", "")
+            # The local transcript observer supplies a stable source key. Commit
+            # its receipt in the same transaction as the exchange and FTS row.
+            source_key = arguments.get("source_key")
+            if source_key:
+                conn.execute("CREATE TABLE IF NOT EXISTS capture_receipts (source_key TEXT PRIMARY KEY, captured_at TEXT DEFAULT CURRENT_TIMESTAMP)")
+                conn.execute("BEGIN IMMEDIATE")
+                inserted = conn.execute("INSERT OR IGNORE INTO capture_receipts(source_key) VALUES (?)", (source_key,))
+                if not inserted.rowcount:
+                    conn.rollback()
+                    return [TextContent(type="text", text="Already captured source exchange")]
 
-        # ── Gap #4: propagate trace_id; generate if absent ──────
-        if not trace_id and HAS_BRIDGE:
-            trace_id = _bridge.get_or_create_trace()
+            # ── Gap #4: propagate trace_id; generate if absent ──────
+            if not trace_id and HAS_BRIDGE:
+                trace_id = _bridge.get_or_create_trace(session_id)
 
-        # ── Gap #9: NAFE scan ────────────────────────────────────
-        nafe_result = {"clean": True, "flags": [], "signatures_detected": []}
-        if HAS_BRIDGE:
-            nafe_result = _bridge.nafe_scan(content)
-        else:
-            # Minimal local NAFE fallback (no bridge)
-            nafe_keywords = ["in the spirit of", "outweighs the rule",
-                             "trust me", "they probably mean", "moral obligation"]
-            nafe_hits = [kw for kw in nafe_keywords if kw in content.lower()]
-            if nafe_hits:
-                nafe_result = {"clean": False,
-                               "flags": [{"signature": "NARRATIVE_RESCUE", "matches": nafe_hits}],
-                               "signatures_detected": ["NARRATIVE_RESCUE"]}
-
-        decisions = extract_decisions(content)
-        blockers  = extract_blockers(content)
-
-        # NAFE flags → promote to tier-A + extend blockers
-        tier = "B"
-        nafe_flags_json = None
-        if not nafe_result["clean"]:
-            tier = "A"
-            nafe_flags_json = json.dumps(nafe_result["flags"])
-            for sig in nafe_result["signatures_detected"]:
-                blockers.append(f"NAFE:{sig}")
-
-        # ── Gap #6: check shared events for TERMINAL_SHUTDOWN ───
-        shutdown_note = ""
-        if HAS_BRIDGE:
-            shutdowns = _bridge.get_recent_terminal_shutdowns(limit=1)
-            if shutdowns:
-                sd = shutdowns[0]
-                # Check if we already ingested this shutdown
-                already = conn.execute(
-                    "SELECT id FROM exchanges WHERE content LIKE ? LIMIT 1",
-                    (f"%CLAEG:TERMINAL_SHUTDOWN%{sd.get('timestamp','')[:16]}%",)
-                ).fetchone()
-                if not already:
-                    sd_content = (f"CLAEG:TERMINAL_SHUTDOWN — Auto-detected from shared event bus. "
-                                  f"Source: {sd.get('source','unknown')} | "
-                                  f"Payload: {json.dumps(sd.get('payload',{}))[:200]} | "
-                                  f"Timestamp: {sd.get('timestamp','')}")
-                    sd_blockers = ["CLAEG:TERMINAL_SHUTDOWN"]
-                    sd_cur = conn.execute(
-                        "INSERT INTO exchanges "
-                        "(role, content, decisions, blockers, tier, milestone, session_id, trace_id) "
-                        "VALUES (?,?,?,?,?,?,?,?)",
-                        ("assistant", sd_content, json.dumps([]),
-                         json.dumps(sd_blockers), "A", "TERMINAL_SHUTDOWN",
-                         session_id, trace_id)
-                    )
-                    sd_id = sd_cur.lastrowid
-                    conn.execute(
-                        "INSERT INTO exchanges_fts(rowid, content, decisions, blockers) VALUES (?,?,?,?)",
-                        (sd_id, sd_content[:4000], json.dumps([]), json.dumps(sd_blockers))
-                    )
-                    shutdown_note = " | ⚠ TERMINAL_SHUTDOWN auto-ingested from bridge"
-
-        # ── Write the actual exchange ────────────────────────────
-        ex_cur = conn.execute(
-            "INSERT INTO exchanges "
-            "(role, content, decisions, blockers, tier, session_id, trace_id, nafe_flags) "
-            "VALUES (?,?,?,?,?,?,?,?)",
-            (role, content, json.dumps(decisions), json.dumps(blockers),
-             tier, session_id, trace_id, nafe_flags_json)
-        )
-        ex_id = ex_cur.lastrowid
-
-        conn.execute(
-            "INSERT INTO exchanges_fts(rowid, content, decisions, blockers) VALUES (?,?,?,?)",
-            (ex_id, content[:4000], json.dumps(decisions), json.dumps(blockers))
-        )
-        conn.commit()
-
-        # ── Gap #12: session-aware compression ──────────────────
-        unprocessed = conn.execute(
-            "SELECT COUNT(*) FROM exchanges WHERE compressed=0 AND session_id=?",
-            (session_id,)
-        ).fetchone()[0]
-        compress_note = ""
-        if unprocessed >= STENO_TURN_LIMIT:
-            brief = compress_unprocessed(conn, current_session_id=session_id)
-            if brief:
-                compress_note = (f" | Compressed {brief['turn_count']} turns "
-                                 f"→ brief {brief['brief_id']} (tier-{brief['tier']})")
-
-        decision_str = f"; decisions: {len(decisions)}" if decisions else ""
-        blocker_str  = f"; blockers: {len(blockers)}" if blockers else ""
-        nafe_str     = f"; ⚠ NAFE:{','.join(nafe_result['signatures_detected'])}" \
-                       if not nafe_result["clean"] else ""
-        trace_str    = f"; trace:{trace_id[:16]}" if trace_id else ""
-
-        return [TextContent(type="text", text=(
-            f"Ingested [{role}] #{ex_id} ({len(content)} chars"
-            f"{decision_str}{blocker_str}{nafe_str}{trace_str})"
-            f"{compress_note}{shutdown_note}"
-        ))]
-    
-    elif name == "stenographer_get_brief":
-        # Build running notes
-        recent = conn.execute(
-            "SELECT id, role, content, decisions, blockers, milestone FROM exchanges WHERE compressed=0 ORDER BY id DESC LIMIT 20"
-        ).fetchall()
-        
-        milestones = conn.execute(
-            "SELECT id, milestone, decisions FROM exchanges WHERE milestone IS NOT NULL ORDER BY id DESC LIMIT 10"
-        ).fetchall()
-        
-        briefs_recent = conn.execute(
-            "SELECT id, summary, tier, created_at FROM briefs ORDER BY id DESC LIMIT 5"
-        ).fetchall()
-        
-        notes = "# Running Session Notes\n\n"
-        
-        if milestones:
-            notes += "## 🔖 Milestones\n"
-            for m in milestones:
-                decisions = json.loads(m[2]) if m[2] else []
-                notes += f"- **{m[1]}** (ex #{m[0]}): {'; '.join(decisions[:2])}\n"
-            notes += "\n"
-        
-        if briefs_recent:
-            notes += "## 📦 Compressed Briefs\n"
-            for b in briefs_recent:
-                notes += f"- [tier-{b[2]}] {b[1][:200]}\n"
-            notes += "\n"
-        
-        notes += "## 📝 Recent Exchanges\n"
-        for ex in reversed(recent):
-            decisions = json.loads(ex[3]) if ex[3] else []
-            blockers = json.loads(ex[4]) if ex[4] else []
-            flags = []
-            if decisions: flags.append(f"💡 {len(decisions)} decisions")
-            if blockers: flags.append(f"🚧 {len(blockers)} blockers")
-            flag_str = f" ({'; '.join(flags)})" if flags else ""
-            notes += f"### [{ex[0]}] {ex[1].upper()}{flag_str}\n{ex[2][:500]}\n\n"
-        
-        return [TextContent(type="text", text=notes)]
-    
-    elif name == "stenographer_compact_guard":
-        query = arguments.get("query", "")
-        
-        # Get recent uncompressed exchanges
-        recent = conn.execute(
-            "SELECT content, decisions FROM exchanges WHERE compressed=0 ORDER BY id DESC LIMIT 10"
-        ).fetchall()
-        
-        # Search briefs by similarity
-        query_vec = tfidf_embed(query)
-        briefs = conn.execute("SELECT id, summary, tier FROM briefs ORDER BY id DESC LIMIT 20").fetchall()
-        
-        ranked = []
-        for b in briefs:
-            bvec = tfidf_embed(b[1])
-            sim = cosine_sim(query_vec, bvec)
-            ranked.append((sim, b[0], b[1], b[2]))
-        ranked.sort(reverse=True)
-        
-        result = "# Compaction Guard Briefing\n\n"
-        result += f"Query: {query[:200]}\n\n"
-        
-        if recent:
-            result += "## 🔴 Live (Uncompressed)\n"
-            for r in recent[:5]:
-                decisions = json.loads(r[1]) if r[1] else []
-                dec_str = f" [Decisions: {'; '.join(decisions[:2])}]" if decisions else ""
-                result += f"- {r[0][:200]}...{dec_str}\n"
-            result += "\n"
-        
-        result += "## 📦 Compressed Briefs (Top-K)\n"
-        for sim, bid, summary, tier in ranked[:STENO_TOP_K]:
-            result += f"- [{tier}] {bid}: {summary[:250]}\n"
-
-        # ── Gap #5: cross-system events from shared event bus ───
-        if HAS_BRIDGE:
-            recent_events = _bridge.read_events(limit=5)
-            if recent_events:
-                result += "\n## 🔗 Cross-System Events (Bridge)\n"
-                for ev in recent_events:
-                    etype = ev.get("event_type", "UNKNOWN")
-                    src   = ev.get("source", "?")
-                    ts    = ev.get("timestamp", "")[:16]
-                    pay   = str(ev.get("payload", {}))[:120]
-                    result += f"- [{ts}] {src}::{etype} — {pay}\n"
-
-        return [TextContent(type="text", text=result)]
-    
-    elif name == "stenographer_mark_milestone":
-        ex_id = arguments["exchange_id"]
-        label = arguments["label"]
-        conn.execute(
-            "UPDATE exchanges SET milestone=?, tier='A' WHERE id=?",
-            (label, ex_id)
-        )
-        conn.commit()
-        return [TextContent(type="text", text=f"Milestone '{label}' set on exchange #{ex_id}")]
-    
-    elif name == "stenographer_query_history":
-        query = arguments["query"]
-        limit = arguments.get("limit", 10)
-        used_query = query
-        query_note = ""
-        try:
-            rows = conn.execute(
-                "SELECT rowid, content, decisions FROM exchanges_fts WHERE exchanges_fts MATCH ? LIMIT ?",
-                (query, limit)
-            ).fetchall()
-        except sqlite3.Error as exc:
-            rows = []
-            fallback_query = normalize_fts_query(query)
-            if fallback_query and fallback_query != query:
-                try:
-                    rows = conn.execute(
-                        "SELECT rowid, content, decisions FROM exchanges_fts WHERE exchanges_fts MATCH ? LIMIT ?",
-                        (fallback_query, limit)
-                    ).fetchall()
-                    used_query = fallback_query
-                    query_note = f"\n_Fallback query used after FTS parse error: `{fallback_query}`_\n\n"
-                except sqlite3.Error as fallback_exc:
-                    query_note = f"\n_Query error: {fallback_exc}_\n\n"
+            # ── Gap #9: NAFE scan ────────────────────────────────────
+            nafe_result = {"clean": True, "flags": [], "signatures_detected": []}
+            if HAS_BRIDGE:
+                nafe_result = _bridge.nafe_scan(content)
             else:
-                query_note = f"\n_Query error: {exc}_\n\n"
-        
-        result = f"# Search: '{query}'\n\n"
-        if used_query != query:
-            result += query_note
-        elif query_note:
-            result += query_note
-        for r in rows:
-            result += f"### [#{r[0]}] {r[1][:300]}\n"
-            if r[2]:
-                decisions = json.loads(r[2]) if isinstance(r[2], str) else r[2]
-                result += f"Decisions: {'; '.join(decisions[:2])}\n"
-            result += "\n"
-        if not rows and not query_note:
-            result += "No results found.\n"
-        
-        return [TextContent(type="text", text=result)]
+                # Minimal local NAFE fallback (no bridge)
+                nafe_keywords = ["in the spirit of", "outweighs the rule",
+                                 "trust me", "they probably mean", "moral obligation"]
+                nafe_hits = [kw for kw in nafe_keywords if kw in content.lower()]
+                if nafe_hits:
+                    nafe_result = {"clean": False,
+                                   "flags": [{"signature": "NARRATIVE_RESCUE", "matches": nafe_hits}],
+                                   "signatures_detected": ["NARRATIVE_RESCUE"]}
 
+            decisions = extract_decisions(content)
+            blockers  = extract_blockers(content)
+
+            # NAFE flags → promote to tier-A + extend blockers
+            tier = "B"
+            nafe_flags_json = None
+            if not nafe_result["clean"]:
+                tier = "B"
+                nafe_flags_json = json.dumps(nafe_result["flags"])
+                for sig in nafe_result["signatures_detected"]:
+                    blockers.append(f"NAFE:{sig}")
+
+            # ── Gap #6: check shared events for TERMINAL_SHUTDOWN ───
+            shutdown_note = ""
+            if HAS_BRIDGE:
+                shutdowns = _bridge.get_recent_terminal_shutdowns(limit=1,task_id=session_id)
+                if shutdowns:
+                    sd = shutdowns[0]
+                    # Check if we already ingested this shutdown
+                    already = conn.execute(
+                        "SELECT id FROM exchanges WHERE session_id=? AND content LIKE ? LIMIT 1",
+                        (session_id,f"%CLAEG:TERMINAL_SHUTDOWN%{sd.get('timestamp','')[:16]}%")
+                    ).fetchone()
+                    if not already:
+                        sd_content = (f"CLAEG:TERMINAL_SHUTDOWN — Auto-detected from shared event bus. "
+                                      f"Source: {sd.get('source','unknown')} | "
+                                      f"Payload: {json.dumps(sd.get('payload',{}))[:200]} | "
+                                      f"Timestamp: {sd.get('timestamp','')}")
+                        sd_blockers = ["CLAEG:TERMINAL_SHUTDOWN"]
+                        sd_cur = conn.execute(
+                            "INSERT INTO exchanges "
+                            "(role, content, decisions, blockers, tier, milestone, session_id, trace_id) "
+                            "VALUES (?,?,?,?,?,?,?,?)",
+                            ("assistant", sd_content, json.dumps([]),
+                             json.dumps(sd_blockers), "B", "TERMINAL_SHUTDOWN",
+                             session_id, trace_id)
+                        )
+                        sd_id = sd_cur.lastrowid
+                        conn.execute(
+                            "INSERT INTO exchanges_fts(rowid, content, decisions, blockers) VALUES (?,?,?,?)",
+                            (sd_id, sd_content, json.dumps([]), json.dumps(sd_blockers))
+                        )
+                        shutdown_note = " | ⚠ TERMINAL_SHUTDOWN auto-ingested from bridge"
+
+            # ── Write the actual exchange ────────────────────────────
+            ex_cur = conn.execute(
+                "INSERT INTO exchanges "
+                "(role, content, decisions, blockers, tier, session_id, trace_id, nafe_flags) "
+                "VALUES (?,?,?,?,?,?,?,?)",
+                (role, content, json.dumps(decisions), json.dumps(blockers),
+                 tier, session_id, trace_id, nafe_flags_json)
+            )
+            ex_id = ex_cur.lastrowid
+
+            conn.execute(
+                "INSERT INTO exchanges_fts(rowid, content, decisions, blockers) VALUES (?,?,?,?)",
+                (ex_id, content, json.dumps(decisions), json.dumps(blockers))
+            )
+            conn.execute('CREATE TABLE IF NOT EXISTS capture_outbox(id TEXT PRIMARY KEY,task_id TEXT,payload TEXT,delivered INTEGER DEFAULT 0)')
+            conn.execute('INSERT OR IGNORE INTO capture_outbox(id,task_id,payload) VALUES(?,?,?)',(f'steno:{ex_id}',session_id,json.dumps({'exchange_id':ex_id,'role':role,'content':content,'decisions':decisions,'blockers':blockers})))
+            conn.commit()
+
+            # ── Gap #12: session-aware compression ──────────────────
+            unprocessed = conn.execute(
+                "SELECT COUNT(*) FROM exchanges WHERE compressed=0 AND session_id=?",
+                (session_id,)
+            ).fetchone()[0]
+            compress_note = ""
+            if unprocessed >= STENO_TURN_LIMIT:
+                brief = compress_unprocessed(conn, current_session_id=session_id)
+                if brief:
+                    compress_note = (f" | Compressed {brief['turn_count']} turns "
+                                     f"→ brief {brief['brief_id']} (tier-{brief['tier']})")
+
+            decision_str = f"; decisions: {len(decisions)}" if decisions else ""
+            blocker_str  = f"; blockers: {len(blockers)}" if blockers else ""
+            nafe_str     = f"; ⚠ NAFE:{','.join(nafe_result['signatures_detected'])}" \
+                           if not nafe_result["clean"] else ""
+            trace_str    = f"; trace:{trace_id[:16]}" if trace_id else ""
+
+            response = [TextContent(type="text", text=(
+                f"Ingested [{role}] #{ex_id} ({len(content)} chars"
+                f"{decision_str}{blocker_str}{nafe_str}{trace_str})"
+                f"{compress_note}{shutdown_note}"
+            ))]
+            return response
+    
+        elif name in ('stenographer_get_brief','stenographer_compact_guard'):
+            sid=arguments.get('session_id')
+            if not sid:raise ValueError('session_id required; global context must be requested explicitly through history search')
+            recent=conn.execute('SELECT id,role,content,decisions,blockers,milestone FROM exchanges WHERE session_id=? AND compressed=0 ORDER BY id DESC LIMIT 20',(sid,)).fetchall()
+            query=arguments.get('query','')
+            terms=runtime.tokens(query)[:20]
+            if terms:
+                match=' OR '.join('"'+t+'"' for t in terms)
+                briefs=conn.execute('SELECT b.id,b.summary,b.source_turns FROM briefs b JOIN briefs_fts f ON f.rowid=b.id WHERE briefs_fts MATCH ? AND b.session_id=? ORDER BY bm25(briefs_fts) LIMIT 20',(match,sid)).fetchall()
+            else:
+                briefs=conn.execute('SELECT id,summary,source_turns FROM briefs WHERE session_id=? ORDER BY id DESC LIMIT 10',(sid,)).fetchall()
+            milestones=conn.execute('SELECT id,milestone,content FROM exchanges WHERE session_id=? AND milestone IS NOT NULL ORDER BY id DESC LIMIT 50',(sid,)).fetchall()
+            return [TextContent(type='text',text=json.dumps({'session_id':sid,'milestones':[dict(r) for r in milestones],'recent':[dict(r) for r in recent],'briefs':[dict(r) for r in briefs],'provenance':'Source exchanges retained in full; extraction is heuristic'},ensure_ascii=False))]
+
+        elif name == "stenographer_mark_milestone":
+            ex_id = arguments["exchange_id"]
+            label = arguments["label"]
+            sid=arguments.get('session_id')
+            if not sid:raise ValueError('session_id required')
+            changed=conn.execute('UPDATE exchanges SET milestone=? WHERE id=? AND session_id=?',(label,ex_id,sid))
+            if not changed.rowcount:raise ValueError('Exchange does not exist in the specified session')
+            conn.commit()
+            response = [TextContent(type="text", text=f"Milestone '{label}' set on exchange #{ex_id}")]
+            return response
+    
+        elif name == 'stenographer_query_history':
+            sid=arguments.get('session_id');cross=arguments.get('cross_session',False)
+            if not sid and not cross:raise ValueError('session_id required or explicit cross_session=true')
+            terms=runtime.tokens(arguments.get('query',''))[:20]
+            if not terms:return [TextContent(type='text',text='[]')]
+            match=' AND '.join('"'+t+'"' for t in terms)
+            scope='' if cross else ' AND e.session_id=?'
+            params=[match]+([] if cross else [sid])+[max(1,min(arguments.get('limit',10),50))]
+            rows=conn.execute('SELECT e.id,e.session_id,e.role,e.content,e.decisions,e.blockers FROM exchanges e JOIN exchanges_fts f ON e.id=f.rowid WHERE exchanges_fts MATCH ?'+scope+' ORDER BY bm25(exchanges_fts) LIMIT ?',params).fetchall()
+            return [TextContent(type='text',text=json.dumps([dict(r) for r in rows],ensure_ascii=False))]
+        elif name=='stenographer_capture_status':
+            path=STENO_DIR/'capture-state.json';status=json.loads(path.read_text()) if path.exists() else {'last_error':'capture never ran'}
+            status.pop('files',None)
+            status['outbox_pending']=conn.execute('SELECT COUNT(*) FROM capture_outbox WHERE delivered=0').fetchone()[0] if conn.execute("SELECT 1 FROM sqlite_master WHERE name='capture_outbox'").fetchone() else 0
+            return [TextContent(type='text',text=json.dumps(status))]
+        else:raise ValueError('Unknown tool')
+
+    finally:
+        conn.close()
 @server.read_resource()
-async def read_resource(uri: str):
-    if uri == "omega-stenographer://session/notes":
-        result = await call_tool("stenographer_get_brief", {})
-        return [Resource(uri=uri, mimeType="text/markdown", text=result[0].text)]
-    elif uri == "omega-stenographer://session/guard":
-        result = await call_tool("stenographer_compact_guard", {"query": ""})
-        return [Resource(uri=uri, mimeType="text/markdown", text=result[0].text)]
-    return []
+async def read_resource(uri):
+    from urllib.parse import urlparse,parse_qs
+    parsed=urlparse(str(uri));sid=parse_qs(parsed.query).get('session_id',[None])[0]
+    if not sid:return json.dumps({'status':'SCOPE_REQUIRED','instruction':'Use the notes or guard tool with session_id.'})
+    tool='stenographer_compact_guard' if parsed.path.endswith('/guard') else 'stenographer_get_brief'
+    return (await call_tool(tool,{'session_id':sid}))[0].text
 
 async def main():
     async with stdio_server() as (read, write):
-        await server.run(read, write, server.create_initialization_options(
-            notification_options=NotificationOptions()
-        ))
+        await server.run(read, write, server.create_initialization_options())
 
 if __name__ == "__main__":
     import asyncio
