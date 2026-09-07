@@ -1,0 +1,76 @@
+name: Validate stdio source checks
+on:
+  push:
+    branches: [fix/stdio-source-check-2026-09-07]
+    paths: [.github/workflows/repair-stdio-source.yml]
+permissions:
+  contents: write
+jobs:
+  repair:
+    if: github.repository == 'VrtxOmega/omega-stenographer-mcp' && github.ref == 'refs/heads/fix/stdio-source-check-2026-09-07'
+    runs-on: windows-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - run: python -m pip install -r requirements.txt pytest
+      - name: Apply the bounded repair and protocol regression
+        shell: python
+        run: |
+          from pathlib import Path
+          path = Path('omega_runtime.py')
+          text = path.read_text(encoding='utf-8')
+          old = 'result = subprocess.run(command, capture_output=True, timeout=10,'
+          assert text.count(old) == 1
+          new = '# Git must never inherit the MCP transport input on Windows.\n            result = subprocess.run(command, stdin=subprocess.DEVNULL, capture_output=True, timeout=10,'
+          path.write_text(text.replace(old, new), encoding='utf-8', newline='\n')
+          Path('tests/test_stdio_source.py').write_text('''"""Source hashing must not inherit or stall an active MCP stdio stream."""
+          import os, subprocess, tempfile, unittest
+          from pathlib import Path
+          from unittest.mock import patch
+          import omega_runtime as runtime
+          from stdio_client import StdioClient
+          ROOT = Path(__file__).resolve().parents[1]
+          class StdioSourceTests(unittest.TestCase):
+              def test_git_input_is_explicitly_disconnected(self):
+                  with tempfile.TemporaryDirectory() as temp:
+                      with patch('subprocess.run', wraps=subprocess.run) as run:
+                          runtime.source_identity(temp)
+                      self.assertTrue(run.call_args_list)
+                      self.assertTrue(all(c.kwargs.get('stdin') == subprocess.DEVNULL for c in run.call_args_list))
+              def test_hashing_over_a_live_stdio_connection(self):
+                  with tempfile.TemporaryDirectory() as temp:
+                      base = Path(temp); source = base/'source'; source.mkdir()
+                      subprocess.run(['git','init',str(source)], stdin=subprocess.DEVNULL, capture_output=True, check=True, timeout=10)
+                      (source/'input.txt').write_text('source input', encoding='utf-8')
+                      script = base/'source_server.py'
+                      lines = ['import sys', 'sys.path.insert(0, '+repr(str(ROOT))+')',
+                               'from mcp.server.fastmcp import FastMCP', 'import omega_runtime as runtime',
+                               "app=FastMCP('source-regression')", '@app.tool()',
+                               'def snapshot(root: str) -> dict:', '    return {"sha256":runtime.source_identity(root)}',
+                               "app.run(transport='stdio')"]
+                      script.write_text(chr(10).join(lines)+chr(10), encoding='utf-8')
+                      with patch.dict(os.environ, {'VERITAS_SHARED_DIR':str(base/'shared'), 'PYTHONUTF8':'1'}):
+                          with StdioClient(script, timeout=15) as client:
+                              first = client.call('snapshot', {'root':str(source)})
+                              self.assertEqual(first['sha256'], runtime.source_identity(source))
+                              self.assertEqual(client.call('snapshot', {'root':str(source)}), first)
+          ''', encoding='utf-8', newline='\n')
+          doc = Path('docs/REVIEW_FOLLOWUP_2026-09-07.md')
+          doc.write_text(doc.read_text(encoding='utf-8') + '\n## Windows stdio follow-up\n\nA real MCP integration run exposed Git inheriting the server input stream and hanging during source enumeration. Git now receives explicit DEVNULL stdin. Regression tests exercise source hashing twice through a live stdio MCP connection, in addition to direct source-manifest tests. Receipt content and permission rules are unchanged.\n', encoding='utf-8', newline='\n')
+      - run: python -m pytest tests/ -v
+        env:
+          PYTHONUTF8: '1'
+      - name: Publish only the tested runtime, regression and operating note
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const fs=require('fs');
+            const files=['omega_runtime.py','tests/test_stdio_source.py','docs/REVIEW_FOLLOWUP_2026-09-07.md'];
+            const input={branch:{repositoryNameWithOwner:`${context.repo.owner}/${context.repo.repo}`,branchName:context.ref.replace('refs/heads/','')},expectedHeadOid:context.sha,message:{headline:'Isolate Git stdin from MCP transport and regress live source checks'},fileChanges:{additions:files.map(p=>({path:p,contents:fs.readFileSync(p).toString('base64')}))}};
+            const result=await github.graphql('mutation($input:CreateCommitOnBranchInput!){createCommitOnBranch(input:$input){commit{oid url}}}',{input});
+            core.notice(JSON.stringify(result.createCommitOnBranch.commit));
