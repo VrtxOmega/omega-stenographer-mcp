@@ -191,7 +191,8 @@ def source_paths(root):
         if mode == '--others': command.append('--exclude-standard')
         command.append('--')
         try:
-            result = subprocess.run(command, capture_output=True, timeout=10,
+            # Git must never inherit the MCP transport input on Windows.
+            result = subprocess.run(command, stdin=subprocess.DEVNULL, capture_output=True, timeout=10,
                                     env=dict(os.environ, LC_ALL='C'))
         except FileNotFoundError:
             return None
