@@ -177,18 +177,61 @@ def approval(tool,args,task_id):
     payload={'version':1,'tool':tool,'args_sha256':hashlib.sha256(canonical(args).encode()).hexdigest(),'source_sha256':source_identity(repo),'task_id':task_id,'policy_sha256':hashlib.sha256(raw).hexdigest(),'expires':int(time.time())+120,'nonce':secrets.token_hex(16)}
     return {'payload':payload,'mac':hmac.new(keypath.read_bytes(),canonical(payload).encode(),hashlib.sha256).hexdigest()}
 
+def source_paths(root):
+    """Tracked and nonignored inputs; tracked files always override exclusions.
+
+    Non-Git folders use a conservative filesystem snapshot. Symlinks and
+    submodules require an explicit packaged snapshot, rather than partial hashes.
+    """
+    import subprocess
+    root = Path(root).resolve(strict=True)
+    excluded = {'.git', 'node_modules', '.venv', '__pycache__', '.sswp.json'}
+    def git_files(mode):
+        command = ['git', '-C', str(root), 'ls-files', mode, '-z']
+        if mode == '--others': command.append('--exclude-standard')
+        command.append('--')
+        try:
+            result = subprocess.run(command, capture_output=True, timeout=10,
+                                    env=dict(os.environ, LC_ALL='C'))
+        except FileNotFoundError:
+            return None
+        if result.returncode:
+            if b'not a git repository' in result.stderr.lower(): return None
+            raise ValueError('Cannot enumerate source inputs: ' + result.stderr.decode('utf-8', 'replace'))
+        return {name for name in result.stdout.decode('utf-8').split('\0') if name}
+    tracked = git_files('--cached')
+    if tracked is not None:
+        other = git_files('--others')
+        if other is None: raise ValueError('Git source enumeration became unavailable')
+        candidates = tracked | {f for f in other if not (set(Path(f).parts) & excluded)}
+    else:
+        candidates = set()
+        for folder, dirs, files in os.walk(root, followlinks=False):
+            dirs[:] = sorted(d for d in dirs if d not in excluded)
+            for name in dirs + files:
+                if name in excluded: continue
+                path = Path(folder) / name
+                if path.is_symlink(): raise ValueError('Source symlinks require an explicit packaged source snapshot')
+                if path.is_file(): candidates.add(path.relative_to(root).as_posix())
+    result = []
+    for name in sorted(candidates):
+        relative = Path(name)
+        if relative.is_absolute() or '..' in relative.parts:
+            raise ValueError('Source path escapes the approved root')
+        path = root
+        for part in relative.parts:
+            path = path / part
+            if path.is_symlink(): raise ValueError('Source symlinks require an explicit packaged source snapshot')
+        if path.is_file(): result.append(relative.as_posix())
+        elif path.is_dir(): raise ValueError('Tracked directories/submodules require an explicit packaged source snapshot')
+        elif path.exists(): raise ValueError('Unsupported source file type')
+    return result
+
 def source_identity(root):
-    """Bind source bytes; installed dependencies and data remain host-trusted."""
-    ignored={'.git','node_modules','.venv','data','__pycache__','.sswp.json'}
-    rows=[]
-    for folder,dirs,files in os.walk(root,followlinks=False):
-        dirs[:]=sorted(d for d in dirs if d not in ignored)
-        for name in dirs+files:
-            path=Path(folder)/name
-            if name in ignored:continue
-            if path.is_symlink():raise ValueError('Source symlinks require an explicit packaged source snapshot')
-            if path.is_file():
-                rows.append((path.relative_to(root).as_posix(),hashlib.sha256(path.read_bytes()).hexdigest()))
-    digest=hashlib.sha256()
-    for name,sha in sorted(rows):digest.update((name+'\0'+sha+'\n').encode())
+    """Hash exact source inputs, including tracked data; ignore generated state."""
+    root = Path(root).resolve(strict=True)
+    digest = hashlib.sha256()
+    for name in source_paths(root):
+        sha = hashlib.sha256((root / name).read_bytes()).hexdigest()
+        digest.update((name + '\0' + sha + '\n').encode())
     return digest.hexdigest()

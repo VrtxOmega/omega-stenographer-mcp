@@ -94,16 +94,17 @@ def emit_event(event_type,payload,source='unknown',task_id=None):
     return runtime.event(task_id or payload.get('task_id') or 'system',event_type,dict(payload,source=source))
 
 def read_events(limit=20,event_type=None,source=None,task_id=None):
-    if not task_id:return []
+    if not task_id: return []
+    predicates, params = ['task_id=?'], [task_id]
+    if event_type is not None:
+        predicates.append('event_type=?'); params.append(event_type)
+    if source is not None:
+        predicates.append("json_extract(payload,'$.source')=?"); params.append(source)
+    params.append(max(1, min(int(limit), 100)))
     with closing(runtime.bus()) as db:
-        rows=db.execute('SELECT * FROM events WHERE task_id=? ORDER BY created_at DESC LIMIT ?',(task_id,max(1,min(limit,100)))).fetchall()
-    result=[]
-    for r in rows:
-        payload=json.loads(r['payload'])
-        if event_type and r['event_type']!=event_type:continue
-        if source and payload.get('source')!=source:continue
-        result.append(dict(r,payload=payload,timestamp=r['created_at']))
-    return result
+        rows = db.execute('SELECT * FROM events WHERE ' + ' AND '.join(predicates)
+                          + ' ORDER BY created_at DESC,id DESC LIMIT ?', params).fetchall()
+    return [dict(r, payload=json.loads(r['payload']), timestamp=r['created_at']) for r in rows]
 
 def get_recent_terminal_shutdowns(limit=3,task_id=None):
     return read_events(limit,'CLAEG_TERMINAL_SHUTDOWN',task_id=task_id)
@@ -209,12 +210,14 @@ def nafe_scan(text: str) -> dict:
 # so dim/tokenizer never drift between Omega Brain fallback and Stenographer.
 # ══════════════════════════════════════════════════════════════════════════════
 
-TFIDF_DIM = 128  # single source of truth for embedding dimension
+TFIDF_DIM = 512  # hash-lexical-v2-512; legacy 128-dimensional vectors must be rebuilt
 
 def tokenize(text: str) -> list:
-    return re.findall(r'[a-zA-Z]{3,}', text.lower())
+    return runtime.tokens(text)
 
-def tfidf_embed(text,dim=512):
+def tfidf_embed(text,dim=TFIDF_DIM):
+    if dim != TFIDF_DIM:
+        raise ValueError('Only 512-dimensional v2 embeddings are supported; rebuild legacy vectors')
     return runtime.embed(text)
 
 def cosine_sim(a,b):
